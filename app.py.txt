@@ -1,0 +1,295 @@
+import streamlit as st
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import math
+import tempfile
+import os
+import requests
+import io
+
+# --- 1. استدعاء المكتبات الضرورية ---
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    ARABIC_SUPPORT = True
+except ImportError:
+    st.error("⚠️ يرجى تثبيت مكتبات اللغة العربية: `pip install arabic-reshaper python-bidi`")
+    st.stop()
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    st.error("⚠️ يرجى تثبيت YOLO: `pip install ultralytics`")
+    st.stop()
+
+# --- 2. إعداد الصفحة ---
+st.set_page_config(page_title="Percepta Ultimate", page_icon="🛡️", layout="wide")
+
+# تنسيق CSS
+st.markdown("""
+<style>
+.report-container { padding: 20px; border-radius: 10px; border: 1px solid #ddd; margin-top: 20px; }
+.prob-box { background-color: #ffebee; border-right: 5px solid #c62828; padding: 15px; margin-bottom: 10px; direction: rtl; }
+.risk-box { background-color: #fff3e0; border-right: 5px solid #ef6c00; padding: 15px; margin-bottom: 10px; direction: rtl; }
+.sol-box  { background-color: #e8f5e9; border-right: 5px solid #2e7d32; padding: 15px; margin-bottom: 10px; direction: rtl; }
+h4 { margin-top: 0; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- 3. الشريط الجانبي (المبسط والمشروح) ---
+with st.sidebar:
+    st.image("https://img.icons8.com/color/96/sensor.png", width=80)
+    st.title("🎛️ إعدادات الرادار")
+    st.markdown("---")
+
+    # إعدادات الذكاء
+    st.header("👁️ قوة الملاحظة (الذكاء)")
+    conf_thresh = st.slider("مدى دقة الكشف", 0.2, 0.8, 0.40)
+    st.caption("""
+    💡 **ماذا يفعل هذا الزر؟**
+    - **لليسار (قيمة قليلة):** يلاحظ أي حركة حتى لو خفيفة (حساس جداً).
+    - **لليمين (قيمة عالية):** لا ينبهك إلا إذا كان متأكداً 100% أنه يرى عاملاً.
+    """)
+
+    st.markdown("---")
+
+    # إعدادات الأمان
+    st.header("📏 مسافات الأمان")
+    high_risk_dist = st.slider("مسافة 'الخطر المميت'", 0.01, 0.15, 0.08)
+    st.caption("""
+    💡 **متى نطلق الإنذار الأحمر؟**
+    - يحدد المسافة المسموحة بين العامل والآلة.
+    - **نصيحة:** القيمة 0.08 ممتازة للمسافات المتوسطة.
+    """)
+
+    st.markdown("---")
+
+    # إعدادات الآلات
+    st.header("🚜 تعريف الآلات")
+    machine_area_ratio = st.slider("حجم المعدات الخطرة", 0.05, 0.5, 0.10)
+    st.caption("""
+    💡 **ما هي الآلة بالنسبة للنظام؟**
+    - **لليسار:** يعتبر الصناديق الصغيرة آلات خطرة.
+    - **لليمين:** يركز فقط على المعدات العملاقة والرافعات.
+    """)
+    st.markdown("---")
+    st.info("ℹ️ التغييرات تطبق فوراً.")
+
+# --- 4. الدوال المساعدة (الخطوط والموديل) ---
+@st.cache_resource
+def get_arabic_font():
+    font_path = "Cairo-Bold.ttf"
+    font_url = "https://github.com/google/fonts/raw/main/ofl/cairo/Cairo-Bold.ttf"
+    
+    # محاولة قراءة الخط الموجود
+    if os.path.exists(font_path):
+        try:
+            return ImageFont.truetype(font_path, 22)
+        except OSError:
+            os.remove(font_path) # حذف الملف التالف
+            
+    # محاولة التنزيل
+    try:
+        r = requests.get(font_url)
+        if r.status_code == 200:
+            with open(font_path, "wb") as f:
+                f.write(r.content)
+            return ImageFont.truetype(font_path, 22)
+    except:
+        pass
+    return ImageFont.load_default()
+
+def process_arabic_text(text):
+    if ARABIC_SUPPORT:
+        try:
+            return get_display(arabic_reshaper.reshape(text))
+        except:
+            return text
+    return text
+
+@st.cache_resource
+def load_model():
+    return YOLO('yolov8n.pt')
+
+try:
+    model = load_model()
+except Exception as e:
+    st.error(f"Error loading model: {e}")
+    st.stop()
+
+def calculate_distance(box1, box2):
+    c1 = ((box1[0] + box1[2])/2, (box1[1] + box1[3])/2)
+    c2 = ((box2[0] + box2[2])/2, (box2[1] + box2[3])/2)
+    return math.sqrt((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)
+
+def get_risk_level(dist, img_diag):
+    norm_dist = dist / img_diag
+    if norm_dist < high_risk_dist: return "HIGH", (255, 0, 0)
+    elif norm_dist < 0.15: return "MEDIUM", (255, 165, 0)
+    return "LOW", (0, 255, 0)
+
+def generate_report_text(status, stats):
+    if status == "DANGER":
+        return {
+            "prob": f"تم رصد {stats['high_risk_count']} حالات لتواجد عمال في 'المنطقة الحمراء' الملاصقة للآلات.",
+            "risk": "خطر داهم للإصابة المباشرة (دهس، انحشار، أو اصطدام) قد يؤدي إلى عجز دائم.",
+            "sol": "1. الإيقاف الفوري للآلات.\n2. إبعاد العمال لمسافة آمنة.\n3. التحقيق في المخالفة."
+        }
+    elif status == "WARNING":
+        return {
+            "prob": "رصد تقارب غير آمن بين المشاة والمعدات.",
+            "risk": "احتمالية وقوع حادث في حال التحرك المفاجئ.",
+            "sol": "1. تنبيه العمال صوتياً.\n2. التأكد من ارتداء السترات."
+        }
+    else:
+        return {
+            "prob": "لا توجد مخالفات مسافات مرئية.",
+            "risk": "مستوى المخاطر منخفض.",
+            "sol": "1. استمرار المراقبة الدورية."
+        }
+
+# --- 5. المحرك الرئيسي (Processing) ---
+def process_frame(image_pil):
+    width, height = image_pil.size
+    img_diag = math.sqrt(width**2 + height**2)
+    
+    results = model(image_pil, conf=conf_thresh, verbose=False)
+    
+    persons = []
+    machines = []
+    
+    for r in results:
+        boxes = r.boxes
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cls = int(box.cls[0])
+            area_ratio = ((x2-x1)*(y2-y1)) / (width*height)
+            
+            if cls == 0: 
+                persons.append({'box': [x1, y1, x2, y2], 'risk': 'LOW', 'color': (0, 255, 0)})
+            else:
+                if area_ratio > machine_area_ratio:
+                    machines.append({'box': [x1, y1, x2, y2]})
+
+    global_risk_status = "SAFE"
+    
+    for p in persons:
+        for m in machines:
+            dist = calculate_distance(p['box'], m['box'])
+            risk_lvl, color = get_risk_level(dist, img_diag)
+            
+            if risk_lvl == "HIGH":
+                p['risk'] = "HIGH"
+                p['color'] = (255, 0, 0)
+                global_risk_status = "DANGER"
+                break
+            elif risk_lvl == "MEDIUM" and p['risk'] != "HIGH":
+                p['risk'] = "MEDIUM"
+                p['color'] = (255, 165, 0)
+                if global_risk_status != "DANGER": global_risk_status = "WARNING"
+
+    draw = ImageDraw.Draw(image_pil)
+    font = get_arabic_font()
+    
+    for m in machines:
+        draw.rectangle(m['box'], outline=(0, 0, 255), width=3)
+        draw.text((m['box'][0], m['box'][1]-25), "Machine", fill=(0, 0, 255), font=font)
+
+    for p in persons:
+        draw.rectangle(p['box'], outline=p['color'], width=4)
+        if p['risk'] in ["HIGH", "MEDIUM"]:
+            overlay = Image.new('RGBA', image_pil.size, (0,0,0,0))
+            d_overlay = ImageDraw.Draw(overlay)
+            cx, cy = (p['box'][0]+p['box'][2])/2, (p['box'][1]+p['box'][3])/2
+            radius = (p['box'][2]-p['box'][0])/1.5
+            d_overlay.ellipse([cx-radius, cy-radius, cx+radius, cy+radius], fill=p['color']+(60,))
+            image_pil = Image.alpha_composite(image_pil.convert('RGBA'), overlay).convert('RGB')
+            draw = ImageDraw.Draw(image_pil)
+
+    # شريط الحالة السفلي
+    banner_height = 60
+    new_img = Image.new("RGB", (width, height + banner_height), (20, 20, 20))
+    new_img.paste(image_pil, (0, 0))
+    d_banner = ImageDraw.Draw(new_img)
+    
+    if global_risk_status == "DANGER":
+        msg_ar = "⚠️ خطر: اقتراب شديد!"
+        bg_color = (200, 0, 0)
+    elif global_risk_status == "WARNING":
+        msg_ar = "⚠️ تحذير: انتبه للمسافات"
+        bg_color = (255, 140, 0)
+    else:
+        msg_ar = "✅ الحالة آمنة"
+        bg_color = (0, 100, 0)
+        
+    d_banner.rectangle([0, height, width, height+banner_height], fill=bg_color)
+    ar_text = process_arabic_text(msg_ar)
+    
+    try:
+        text_w = d_banner.textlength(ar_text, font=font)
+        d_banner.text((width - 20 - text_w, height + 15), ar_text, font=font, fill="white")
+    except:
+        d_banner.text((width - 150, height + 15), ar_text, font=font, fill="white")
+
+    stats = {
+        "persons": len(persons),
+        "machines": len(machines),
+        "status": global_risk_status,
+        "high_risk_count": sum(1 for p in persons if p['risk'] == "HIGH")
+    }
+    return new_img, stats
+
+# --- 6. واجهة المستخدم (Main UI) ---
+st.title("🛡️ Percepta: Industrial Safety AI")
+st.markdown("##### نظام ذكي لمراقبة السلامة المهنية وتحليل المخاطر")
+
+uploaded_file = st.file_uploader("رفع صورة أو فيديو للمراقبة", type=['jpg', 'png', 'jpeg', 'mp4'])
+
+if uploaded_file:
+    if uploaded_file.type.startswith('image'):
+        image = Image.open(uploaded_file).convert('RGB')
+        
+        with st.spinner('جاري المسح والتحليل...'):
+            processed_img, stats = process_frame(image)
+            
+        c1, c2, c3 = st.columns(3)
+        c1.metric("العمال", stats['persons'])
+        c2.metric("الآلات", stats['machines'])
+        c3.metric("مخالفات حمراء", stats['high_risk_count'], delta_color="inverse")
+        
+        st.image(processed_img, use_container_width=True)
+        
+        st.divider()
+        st.subheader("📋 التقرير الفني المفصل")
+        report_content = generate_report_text(stats['status'], stats)
+        
+        st.markdown(f"""
+        <div class="report-container">
+            <div class="prob-box"><h4>🔴 المشكلة:</h4>{report_content['prob']}</div>
+            <div class="risk-box"><h4>🟠 الخطر:</h4>{report_content['risk']}</div>
+            <div class="sol-box"><h4>🟢 الحل:</h4>{report_content['sol']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        buf = io.BytesIO()
+        processed_img.save(buf, format="JPEG")
+        st.download_button("📥 تحميل التقرير", data=buf.getvalue(), file_name="percepta_report.jpg", mime="image/jpeg")
+
+    elif uploaded_file.type.startswith('video'):
+        tfile = tempfile.NamedTemporaryFile(delete=False) 
+        tfile.write(uploaded_file.read())
+        cap = cv2.VideoCapture(tfile.name)
+        st_frame = st.empty()
+        curr_frame = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
+            if curr_frame % 5 == 0:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                processed_img, _ = process_frame(Image.fromarray(frame_rgb))
+                st_frame.image(processed_img, use_container_width=True)
+            curr_frame += 1
+        cap.release()
+else:
+    st.info("👆 يرجى رفع ملف للبدء")
