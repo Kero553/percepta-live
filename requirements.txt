@@ -1,8 +1,2 @@
-streamlit
-ultralytics
-opencv-python-headless
-pillow
-numpy
-arabic-reshaper
-python-bidi
-requests
+libgl1-mesa-glx
+libglib2.0-0
