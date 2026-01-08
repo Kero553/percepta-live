@@ -292,4 +292,5 @@ if uploaded_file:
             curr_frame += 1
         cap.release()
 else:
+
     st.info("👆 يرجى رفع ملف للبدء")
